@@ -27,6 +27,12 @@ if (session_status() !== PHP_SESSION_ACTIVE) {
     session_start();
 }
 
+$sellerBalanceHelper = dirname(__DIR__) . '/includes/seller_balance.php';
+if (is_file($sellerBalanceHelper)) {
+    require_once $sellerBalanceHelper;
+}
+$sellerBalanceHelperAvailable = is_file($sellerBalanceHelper);
+
 if (!function_exists('h')) {
     function h($value)
     {
@@ -307,6 +313,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         bv_seller_payouts_require_csrf();
         $action = (string) ($_POST['action'] ?? '');
 
+
+        if (!$sellerBalanceHelperAvailable) {
+            throw new RuntimeException('Seller balance helper is missing; payout actions are disabled.');
+        }
+		
         if ($action === 'approve_request') {
             if (!function_exists('bv_seller_balance_approve_payout')) {
                 throw new RuntimeException('Payout approval helper is unavailable.');
@@ -427,10 +438,10 @@ foreach (['sellers', 'seller_balances', 'seller_balance'] as $table) {
     }
 }
 
-$actionsEnabled = true;
+$actionsEnabled = $sellerBalanceHelperAvailable;
 $isSuperAdmin = bv_seller_payouts_is_owner();
 $approveAvailable = $actionsEnabled && $hasPayouts && function_exists('bv_seller_balance_approve_payout');
-$canMarkPaid = $isSuperAdmin && function_exists('bv_seller_balance_mark_payout_paid');
+$canMarkPaid = $actionsEnabled && $isSuperAdmin && function_exists('bv_seller_balance_mark_payout_paid');
 $adjustBalanceAvailable = $actionsEnabled && $isSuperAdmin && function_exists('bv_seller_balance_admin_adjust');
 $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('bv_seller_balance_release_pending') && function_exists('bv_seller_balance_get');
 ?>
@@ -470,6 +481,10 @@ $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('
     <?php foreach ($errors as $error): ?>
         <div class="alert alert-danger"><?php echo h($error); ?></div>
     <?php endforeach; ?>
+
+    <?php if (!$sellerBalanceHelperAvailable): ?>
+        <div class="alert alert-warning">Seller balance helper is missing; payout actions are disabled.</div>
+    <?php endif; ?>	
 
     <?php if (!$approveAvailable): ?>
         <div class="alert alert-warning">Approve is disabled because bv_seller_balance_approve_payout() is unavailable.</div>
