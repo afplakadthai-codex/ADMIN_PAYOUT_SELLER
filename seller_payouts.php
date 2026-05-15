@@ -4,7 +4,7 @@
  *
  * Security notes:
  * - All mutations are POST-only and require a CSRF token.
- * - Payout approval is delegated exclusively to bv_seller_balance_approve_payout().
+ * - Payout rejection is delegated exclusively to bv_seller_balance_reject_payout().
  * - Mark-paid is superadmin/owner-only and requires a payment reference.
  * - Admin balance adjustments are delegated exclusively to bv_seller_balance_admin_adjust().
  * - Pending releases always re-read the current pending balance server-side.
@@ -251,8 +251,30 @@ if (empty($_SESSION['seller_payouts_csrf'])) {
 }
 
 $csrfToken = $_SESSION['seller_payouts_csrf'];
-$messages = [];
-$errors = [];
+$messages = $_SESSION['seller_payouts_flash']['messages'] ?? [];
+$errors = $_SESSION['seller_payouts_flash']['errors'] ?? [];
+unset($_SESSION['seller_payouts_flash']);
+
+
+if (!function_exists('bv_seller_payouts_flash')) {
+    function bv_seller_payouts_flash($type, $message)
+    {
+        $type = $type === 'error' ? 'errors' : 'messages';
+        if (!isset($_SESSION['seller_payouts_flash'][$type]) || !is_array($_SESSION['seller_payouts_flash'][$type])) {
+            $_SESSION['seller_payouts_flash'][$type] = [];
+        }
+        $_SESSION['seller_payouts_flash'][$type][] = (string) $message;
+    }
+}
+
+if (!function_exists('bv_seller_payouts_redirect')) {
+    function bv_seller_payouts_redirect()
+    {
+        header('Location: seller_payouts.php', true, 303);
+        exit;
+    }
+}
+
 
 if (!function_exists('bv_seller_payouts_require_csrf')) {
     function bv_seller_payouts_require_csrf()
@@ -264,36 +286,61 @@ if (!function_exists('bv_seller_payouts_require_csrf')) {
     }
 }
 
-if (!function_exists('bv_seller_payouts_read_pending_balance')) {
-    function bv_seller_payouts_read_pending_balance($sellerId)
+if (!function_exists('bv_seller_payouts_balance_value')) {
+    function bv_seller_payouts_balance_value($balance, array $keys, $default = 0.0)
+    {
+        if (is_array($balance)) {
+            foreach ($keys as $key) {
+                if (array_key_exists($key, $balance) && is_numeric($balance[$key])) {
+                    return (float) $balance[$key];
+                }
+            }
+        } elseif (is_object($balance)) {
+            foreach ($keys as $key) {
+                if (isset($balance->{$key}) && is_numeric($balance->{$key})) {
+                    return (float) $balance->{$key};
+                }
+            }
+        }
+
+        return (float) $default;
+    }
+}
+
+if (!function_exists('bv_seller_payouts_read_balance')) {
+    function bv_seller_payouts_read_balance($sellerId)
     {
         $sellerId = (int) $sellerId;
         if ($sellerId <= 0) {
-            return 0.0;
-        }
+           return [
+                'available' => 0.0,
+                'pending' => 0.0,
+                'locked' => 0.0,
+                'paid_out' => 0.0,
+                'total' => 0.0,
+            ];
+ }
 
         if (!function_exists('bv_seller_balance_get')) {
             throw new RuntimeException('Seller balance source-of-truth helper is unavailable.');
         }
 
         $balance = bv_seller_balance_get($sellerId);
-        if (is_array($balance)) {
-            foreach (['pending', 'pending_balance', 'pending_amount'] as $key) {
-                if (isset($balance[$key])) {
-                    return max(0.0, (float) $balance[$key]);
-                }
-            }
-        } elseif (is_object($balance)) {
-            foreach (['pending', 'pending_balance', 'pending_amount'] as $key) {
-                if (isset($balance->{$key})) {
-                    return max(0.0, (float) $balance->{$key});
-                }
-            }
-        } elseif (is_numeric($balance)) {
-            return max(0.0, (float) $balance);
-        }
+        return [
+            'available' => bv_seller_payouts_balance_value($balance, ['available', 'available_balance', 'balance', 'current_balance']),
+            'pending' => max(0.0, bv_seller_payouts_balance_value($balance, ['pending', 'pending_balance', 'pending_amount'])),
+            'locked' => bv_seller_payouts_balance_value($balance, ['locked', 'locked_balance', 'held', 'hold_balance']),
+            'paid_out' => bv_seller_payouts_balance_value($balance, ['paid_out', 'paidout', 'paid_out_balance', 'total_paid_out', 'payouts_paid']),
+            'total' => bv_seller_payouts_balance_value($balance, ['total', 'total_balance', 'lifetime_total']),
+        ];
+    }
+} 
 
-        return 0.0;
+if (!function_exists('bv_seller_payouts_read_pending_balance')) {
+    function bv_seller_payouts_read_pending_balance($sellerId)
+    {
+        $balance = bv_seller_payouts_read_balance($sellerId);
+        return max(0.0, (float) ($balance['pending'] ?? 0.0));
     }
 }
 
@@ -318,6 +365,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             throw new RuntimeException('Seller balance helper is missing; payout actions are disabled.');
         }
 		
+		
         if ($action === 'approve_request') {
             if (!function_exists('bv_seller_balance_approve_payout')) {
                 throw new RuntimeException('Payout approval helper is unavailable.');
@@ -329,7 +377,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             bv_seller_balance_approve_payout($requestId, bv_seller_payouts_current_admin_id());
-            $messages[] = 'Payout request approved.';
+            bv_seller_payouts_flash('message', 'Payout request approved.');
+        } elseif ($action === 'reject_request') {
+            if (!function_exists('bv_seller_balance_reject_payout')) {
+                throw new RuntimeException('Payout rejection helper is unavailable.');
+            }
+
+            $requestId = (int) ($_POST['request_id'] ?? 0);
+            $adminNote = trim((string) ($_POST['admin_note'] ?? ''));
+            if ($requestId <= 0) {
+                throw new RuntimeException('Invalid payout request.');
+            }
+            if ($adminNote === '') {
+                throw new RuntimeException('Admin note is required to reject a payout request.');
+            }
+
+            bv_seller_balance_reject_payout($requestId, $adminNote, bv_seller_payouts_current_admin_id());
+            bv_seller_payouts_flash('message', 'Payout request rejected.'); 
         } elseif ($action === 'mark_paid') {
             if (!bv_seller_payouts_is_owner()) {
                 throw new RuntimeException('Only superadmin/owner users can mark payouts paid.');
@@ -348,7 +412,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             bv_seller_balance_mark_payout_paid($requestId, $paymentReference, bv_seller_payouts_current_admin_id());
-            $messages[] = 'Payout marked paid.';
+             bv_seller_payouts_flash('message', 'Payout marked paid.');
         } elseif ($action === 'release_pending') {
             if (!bv_seller_payouts_is_owner()) {
                 throw new RuntimeException('Only superadmin/owner users can release pending balances.');
@@ -368,7 +432,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             bv_seller_payouts_release_pending_balance($sellerId, $pendingBalance);
-            $messages[] = 'Pending balance released.';
+            bv_seller_payouts_flash('message', 'Pending balance released.');
         } elseif ($action === 'adjust_balance') {
             if (!bv_seller_payouts_is_owner()) {
                 throw new RuntimeException('Only superadmin/owner users can adjust balances.');
@@ -391,13 +455,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             bv_seller_balance_admin_adjust($sellerId, $amount, $reason, bv_seller_payouts_current_admin_id());
-            $messages[] = 'Seller balance adjusted.';
+             bv_seller_payouts_flash('message', 'Seller balance adjusted.');
         } else {
             throw new RuntimeException('Unknown action.');
         }
     } catch (Throwable $e) {
-        $errors[] = $e->getMessage();
+        bv_seller_payouts_flash('error', $e->getMessage());
     }
+	
+    bv_seller_payouts_redirect();	
 }
 
 $payoutRequests = [];
@@ -441,6 +507,7 @@ foreach (['sellers', 'seller_balances', 'seller_balance'] as $table) {
 $actionsEnabled = $sellerBalanceHelperAvailable;
 $isSuperAdmin = bv_seller_payouts_is_owner();
 $approveAvailable = $actionsEnabled && $hasPayouts && function_exists('bv_seller_balance_approve_payout');
+$rejectAvailable = $actionsEnabled && $hasPayouts && function_exists('bv_seller_balance_reject_payout');
 $canMarkPaid = $actionsEnabled && $isSuperAdmin && function_exists('bv_seller_balance_mark_payout_paid');
 $adjustBalanceAvailable = $actionsEnabled && $isSuperAdmin && function_exists('bv_seller_balance_admin_adjust');
 $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('bv_seller_balance_release_pending') && function_exists('bv_seller_balance_get');
@@ -484,11 +551,16 @@ $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('
 
     <?php if (!$sellerBalanceHelperAvailable): ?>
         <div class="alert alert-warning">Seller balance helper is missing; payout actions are disabled.</div>
-    <?php endif; ?>	
+
+    <?php endif; ?>
 
     <?php if (!$approveAvailable): ?>
         <div class="alert alert-warning">Approve is disabled because bv_seller_balance_approve_payout() is unavailable.</div>
     <?php endif; ?>
+	
+   <?php if (!$rejectAvailable): ?>
+        <div class="alert alert-warning">Reject is disabled because bv_seller_balance_reject_payout() is unavailable.</div>
+    <?php endif; ?>	
 
     <?php if (!function_exists('bv_seller_balance_mark_payout_paid')): ?>
         <div class="alert alert-warning">Mark Paid is disabled because bv_seller_balance_mark_payout_paid() is unavailable.</div>
@@ -513,7 +585,10 @@ $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('
             <tr><td colspan="6">No payout requests found.</td></tr>
         <?php endif; ?>
         <?php foreach ($payoutRequests as $request): ?>
-            <?php $status = (string) ($request['status'] ?? ''); ?>
+            <?php
+            $status = strtolower((string) ($request['status'] ?? ''));
+            $requestId = (int) ($request['id'] ?? 0);
+            ?>
             <tr>
                 <td><?php echo h($request['id'] ?? ''); ?></td>
                 <td><?php echo h($request['seller_id'] ?? ''); ?></td>
@@ -522,19 +597,32 @@ $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('
                 <td><?php echo h($request['created_at'] ?? ''); ?></td>
                 <td>
                     <form class="inline" method="post">
-                        <input type="hidden" name="csrf_token" value="<?php echo h($csrfToken); ?>">
-                        <input type="hidden" name="action" value="approve_request">
-                        <input type="hidden" name="request_id" value="<?php echo h($request['id'] ?? 0); ?>">
-                        <button type="submit" <?php echo $approveAvailable ? '' : 'disabled'; ?>>Approve</button>
-                    </form>
+                    <?php if (in_array($status, ['pending', 'requested'], true)): ?>
+                        <form class="inline" method="post">
+                            <input type="hidden" name="csrf_token" value="<?php echo h($csrfToken); ?>">
+                            <input type="hidden" name="action" value="approve_request">
+                            <input type="hidden" name="request_id" value="<?php echo h($requestId); ?>">
+                            <button type="submit" <?php echo $approveAvailable ? '' : 'disabled'; ?>>Approve</button>
+                        </form>
 
-                    <form class="inline" method="post">
-                        <input type="hidden" name="csrf_token" value="<?php echo h($csrfToken); ?>">
-                        <input type="hidden" name="action" value="mark_paid">
-                        <input type="hidden" name="request_id" value="<?php echo h($request['id'] ?? 0); ?>">
-                        <input type="text" name="payment_reference" placeholder="Payment reference" required>
-                        <button type="submit" <?php echo $canMarkPaid ? '' : 'disabled'; ?>>Mark Paid</button>
-                    </form>
+                        <form class="inline" method="post">
+                            <input type="hidden" name="csrf_token" value="<?php echo h($csrfToken); ?>">
+                            <input type="hidden" name="action" value="reject_request">
+                            <input type="hidden" name="request_id" value="<?php echo h($requestId); ?>">
+                            <input type="text" name="admin_note" placeholder="Admin note" required>
+                            <button type="submit" <?php echo $rejectAvailable ? '' : 'disabled'; ?>>Reject</button>
+                        </form>
+                    <?php elseif ($status === 'approved'): ?>
+                        <form class="inline" method="post">
+                            <input type="hidden" name="csrf_token" value="<?php echo h($csrfToken); ?>">
+                            <input type="hidden" name="action" value="mark_paid">
+                            <input type="hidden" name="request_id" value="<?php echo h($requestId); ?>">
+                            <input type="text" name="payment_reference" placeholder="Payment reference" required>
+                            <button type="submit" <?php echo $canMarkPaid ? '' : 'disabled'; ?>>Mark Paid</button>
+                        </form>
+                    <?php else: ?>
+                        <span class="badge <?php echo h(status_badge_class($status)); ?>"><?php echo h($status ?: 'unknown'); ?></span>
+                    <?php endif; ?> 
                 </td>
             </tr>
         <?php endforeach; ?>
@@ -552,20 +640,31 @@ $releasePendingAvailable = $actionsEnabled && $isSuperAdmin && function_exists('
         </thead>
         <tbody>
         <?php if (!$sellers): ?>
-            <tr><td colspan="3">No sellers found.</td></tr>
+            <tr><td colspan="7">No sellers found.</td></tr>
         <?php endif; ?>
         <?php foreach ($sellers as $seller): ?>
             <?php
             $sellerId = (int) ($seller['seller_id'] ?? 0);
             try {
-                $pendingBalance = bv_seller_payouts_read_pending_balance($sellerId);
+                 $sellerBalance = bv_seller_payouts_read_balance($sellerId); 
             } catch (Throwable $e) {
-                $pendingBalance = 0.0;
+                 $sellerBalance = [
+                    'available' => 0.0,
+                    'pending' => 0.0,
+                    'locked' => 0.0,
+                    'paid_out' => 0.0,
+                    'total' => 0.0,
+                ]; 
             }
+            $pendingBalance = (float) ($sellerBalance['pending'] ?? 0.0);			
             ?>
             <tr>
                 <td><?php echo h(seller_label($seller)); ?> (#<?php echo h($sellerId); ?>)</td>
-                <td><?php echo h(money_fmt($pendingBalance)); ?></td>
+                <td><?php echo h(money_fmt($sellerBalance['available'] ?? 0)); ?></td>
+                <td><?php echo h(money_fmt($sellerBalance['pending'] ?? 0)); ?></td>
+                <td><?php echo h(money_fmt($sellerBalance['locked'] ?? 0)); ?></td>
+                <td><?php echo h(money_fmt($sellerBalance['paid_out'] ?? 0)); ?></td>
+                <td><?php echo h(money_fmt($sellerBalance['total'] ?? 0)); ?></td>
                 <td>
                     <form class="inline" method="post">
                         <input type="hidden" name="csrf_token" value="<?php echo h($csrfToken); ?>">
